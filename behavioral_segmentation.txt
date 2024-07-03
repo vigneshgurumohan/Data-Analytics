@@ -1,0 +1,165 @@
+# Importing necessary libraries and functions
+
+from pyspark.sql.functions import *
+from pyspark.sql.functions import udf
+from pyspark.sql import functions as F
+from pyspark.sql import Window
+from pyspark.ml.feature import VectorAssembler, StandardScaler, StringIndexer, OneHotEncoder
+from pyspark.ml.clustering import GaussianMixture
+from pyspark.ml import Pipeline
+import numpy as np
+from pyspark.sql.types import ArrayType, DoubleType
+
+# Input data read
+transclean = spark.read.parquet("abfs://platform@hdfcindproddatalake.dfs.core.windows.net/vignesh/sample/cleanse/transaction_clean")
+custclean = spark.read.parquet("abfs://platform@hdfcindproddatalake.dfs.core.windows.net/vignesh/sample/cleanse/customer_clean")
+
+# Function to flag MCC codes
+def flag_mcc_code(mcc_code):
+    if mcc_code in ["5942","5192"]: return"avid_reader"
+    elif mcc_code in ["5462"]: return"bakery_lover"
+    elif mcc_code in ["4131"]: return"bus_traveller"
+    elif mcc_code in ["7512","4784","7538","5983","7523","5013","7534","7542"]: return"car_enthusiast"
+    elif mcc_code in ["5641"]: return"children_shopper"
+    elif mcc_code in ["5812","5814","5499"]: return"diner"
+    elif mcc_code in ["5722","5732","5944"]: return"electronics_enthusiast"
+    elif mcc_code in ["3020","4511","4215","3034","3026","3008","3005"]: return"flight_traveller"
+    elif mcc_code in ["5816","7994","5945"]: return"gamer"
+    elif mcc_code in ["5411","5311","5451","5441","5422"]: return"groceries"
+    elif mcc_code in ["5712","5200","5719","7394","5271","5039","5211"]: return"home_enthusiast"
+    elif mcc_code in ["7011","3640","3533","3649"]: return"hotel"
+    elif mcc_code in ["7832","5815","7829"]: return"movie_freak"
+    elif mcc_code in ["5995","742"]: return"pet_parent"
+    elif mcc_code in ["5661"]: return"shoes_shopper"
+    elif mcc_code in ["5699","5399","5651","5691","5611"]: return"general_shopper"
+    elif mcc_code in ["5941","5655"]: return"sports_shopper"
+    elif mcc_code in ["5734","7372","5817","5045","7379"]: return"tech_enthusiast"
+    elif mcc_code in ["4112","4111"]: return"train_traveller"
+    elif mcc_code in ["4722",'4121',"4214","4789"]: return"traveller"
+    elif mcc_code in ["5813","5921","5993"]: return"wine_connoisseur"
+    elif mcc_code in ["5621","5631","5697"]: return"women_shopper"
+    else: return "others"
+
+# Registering UDF for MCC code flagging
+flag_mcc_code_udf = udf(flag_mcc_code,StringType())
+
+# Applying MCC code flagging and aggregation
+transclean = transclean.withColumn("mcc_flag",flag_mcc_code_udf(col("mcc_code")))
+df = transclean.groupBy("customer_id","mcc_flag").agg((sum("tran_amount")/count("tran_amount")).alias("tkt_size"))
+
+# Function to calculate percentiles
+def calculate_percentiles(column) : return F.expr(f"percentile_approx({column},array(0.50,0.75))")
+
+percentile_df = df.groupBy("mcc_flag").agg(calculate_percentiles("tkt_size").alias("tkt_size_perc"))
+
+# Computing percentiles for ticket sizes by MCC flag         
+percentile_df = percentile_df\
+                .withColumn("tkt_size_p50",percentile_df.tkt_size_perc.getItem(0))\
+                .withColumn("tkt_size_p75",percentile_df.tkt_size_perc.getItem(1))
+
+
+# Function to assign flag based on percentiles
+def assign_flag(value,p50,p75):
+    if value is None: return "low"
+    elif value <= p50 : return "low"
+    elif value <= p75: return "medium"
+    else: return "high"
+
+# Registering UDF for flag assignment
+assign_flag_udf = F.udf(assign_flag,F.StringType())
+
+
+# Joining percentiles and assigning flags to the main dataframe
+df = df.join(percentile_df, on = "mcc_flag", how ="left")
+df = df.withColumn("tkt_size_flag",assign_flag_udf(F.col("tkt_size"),F.col("tkt_size_p50"),F.col("tkt_size_p75")))
+df = df.groupBy("customer_id").pivot("mcc_flag").agg(first("tkt_size_flag").alias("tkt_size_flag"),sum("tkt_size").alias("tkt_size"))\
+.join(custclean.select("customer_id","gender").withColumn("gender",when(col("gender").isin("M","F","Male","Female","m","f","male","female"),col("gender")).otherwise(lit("UNK"))),on = "customer_id", how = "inner")
+
+
+# Extracting column information for processing
+columns = df.columns
+exclusion_list = ["customer_id"]
+column_types = {col.name: col.dataType for col in df.schema}
+flag_columns = [col for col, dtype in column_types.items() if dtype == StringType() and col not in exclusion_list]
+tkt_size_columns = [col for col, dtype in column_types.items() if dtype == DoubleType()]
+
+
+# Function to replace nulls, empty strings, and NaNs
+def replace_null_empty_nan(df):
+    flag_columns = [col for col in df.columns if 'flag' in col]
+    for col_name in flag_columns:
+        df = df.withColumn(col_name,when(col(col_name).isNull() | (col(col_name) == '') | isnan(col(col_name)), lit("low")).otherwise(col(col_name)))
+    return df
+
+df = replace_null_empty_nan(df).na.fill(0)
+
+
+# Setting up pipeline for categorical encoding and clustering
+indexers = [StringIndexer(inputCol=col, outputCol=col + "_index", handleInvalid= "skip") for col in flag_columns]
+encoders  = [OneHotEncoder(inputCol=col + "_index", outputCol=col + "_vec") for col in flag_columns]
+assembler = VectorAssembler(inputCols = [col + "_vec" for col in flag_columns] + tkt_size_columns,outputCol="features")
+scaler = StandardScaler(inputCol="features", outputCol="scaled_features")
+pipeline_stages = indexers + encoders + [assembler, scaler]
+
+# Finding optimal number of clusters using BIC values
+bic_values = []
+k_values = range(5,11)
+
+for k in k_values:
+    gmm = GaussianMixture(featuresCol="scaled_features", k=k,seed = 123)
+    pipeline = Pipeline(stages=pipeline_stages + [gmm])
+    model = pipeline.fit(df)
+    logLikelihood = model.stages[-1].summary.logLikelihood
+    n = df.count()
+    bic = np.log(n) * k - 2 * logLikelihood
+    bic_values.append((k, bic))
+
+# Determining the optimal number of clusters (k)
+min_bic_value = float('inf')
+
+optimal_k = None
+for k , bic in bic_values:
+    if bic < min_bic_value: min_bic_value = bic
+    optimal_k = k
+print(f"The optimal number of clusters (k) is: {optimal_k}")
+
+# Final clustering using the optimal k and extracting cluster probabilities
+gmm = GaussianMixture(featuresCol="scaled_features", k=optimal_k)
+pipeline = Pipeline(stages=pipeline_stages + [gmm])
+model = pipeline.fit(df).transform(df)
+
+
+# UDF to extract probabilities from probability vector
+def extract_probabilities(probability_vector):
+    return probability_vector.toArray().tolist()
+extract_probabilities_udf = udf(extract_probabilities, ArrayType(DoubleType()))
+
+# Applying UDF to extract probabilities and joining with customer data
+model = model.withColumn("cluster_probabilities", extract_probabilities_udf(model["probability"]))\
+
+for i in range(optimal_k):
+    model = model.withColumn(f"prob_of_cluster_{i}",col("cluster_probabilities")[i])
+
+
+# Final join with customer-specific information
+model = model.join(custclean.select("customer_id","card_type","customer_city"),on = "customer_id", how = "left")
+
+
+----write--output--
+model.write.mode("overwrite").parquet("abfs://platform@hdfcindproddatalake.dfs.core.windows.net/vignesh/sample/op/clusters")
+
+
+# Validation: Counting nulls in the dataframe
+null_counts = df.select([sum(col(column).isNull().cast("integer")).alias(column) for column in df.columns])
+null_counts.show()
+
+# Summary: Displaying average membership percentages by cluster
+cluster_names = [col for col in clusters.columns if 'prob_' in col]
+display(clusters.groupBy("prediction").agg(*[avg(c).alias(f"{c}_avg_membership_perc") for c in cluster_names]))
+
+# Summary: Displaying high counts and average ticket sizes by cluster
+display(
+clusters.groupBy("prediction").agg(*[count(when(col(c) == "high",c)).alias(f"{c}_high_count") for c in flag_columns],\
+*[avg(c).alias(f"{c}_avg__tkt_size") for c in tkt_size_columns])\
+.orderBy(col("prediction")))
+
