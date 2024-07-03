@@ -11,8 +11,8 @@ import numpy as np
 from pyspark.sql.types import ArrayType, DoubleType
 
 # Input data read
-transclean = spark.read.parquet("abfs://platform@hdfcindproddatalake.dfs.core.windows.net/vignesh/sample/cleanse/transaction_clean")
-custclean = spark.read.parquet("abfs://platform@hdfcindproddatalake.dfs.core.windows.net/vignesh/sample/cleanse/customer_clean")
+transclean = spark.read.parquet("transaction_clean_path")
+custclean = spark.read.parquet("customer_clean_path")
 
 # Function to flag MCC codes
 def flag_mcc_code(mcc_code):
@@ -146,7 +146,7 @@ model = model.join(custclean.select("customer_id","card_type","customer_city"),o
 
 
 ----write--output--
-model.write.mode("overwrite").parquet("abfs://platform@hdfcindproddatalake.dfs.core.windows.net/vignesh/sample/op/clusters")
+model.write.mode("overwrite").parquet("op/clusters")
 
 
 # Validation: Counting nulls in the dataframe
