@@ -163,3 +163,18 @@ clusters.groupBy("prediction").agg(*[count(when(col(c) == "high",c)).alias(f"{c}
 *[avg(c).alias(f"{c}_avg__tkt_size") for c in tkt_size_columns])\
 .orderBy(col("prediction")))
 
+# Summary:ANOVA test
+#Extracting the necessary columns (all tkt_size columns and cluster predictions)
+tkt_size_columns = [col for col in model.columns if 'tkt_size' in col and 'tkt_size_flag' not in col]
+# Convert the Spark DataFrame to Pandas DataFrame for easier manipulation
+data = model.select("prediction", *tkt_size_columns).toPandas()
+# Performing ANOVA test for each tkt_size column
+anova_results = {}
+for column in tkt_size_columns:
+    cluster_groups = data.groupby('prediction')[column].apply(list)
+    anova_result = f_oneway(*cluster_groups)
+    anova_results[column] = (anova_result.statistic, round(anova_result.pvalue, 4))
+# Printing the ANOVA results
+for column, (f_value, p_value) in anova_results.items():
+    print(f"ANOVA test results for {column}: F-value = {f_value}, p-value = {p_value}")
+
