@@ -1,0 +1,91 @@
+import openai
+from langchain_core.prompts import PromptTemplate
+from langchain.chains import LLMChain
+from langchain_core.output_parsers import BaseOutputParser
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel
+import logging, string
+import json
+import pandas as pd
+from itertools import islice
+from typing import List
+from langchain.pydantic_v1 import BaseModel, Field, validator
+from langchain.output_parsers import PydanticOutputParser
+
+file_path = 'mapping_raw.csv'  # Replace with your actual CSV file path
+df = pd.read_csv(file_path)
+
+def chunk_list(data_list, chunk_size):
+    """Splits a list into chunks of a given size."""
+    it = iter(data_list)
+    return iter(lambda: list(islice(it, chunk_size)), [])
+
+class MerchantComparisonResult(BaseModel):
+    decision: int  = Field(description="score between 0-100 output for each comparison between raw and cleaned name")
+    reason: str  = Field(description="Descriptive reasoning for the descision you have taken")
+
+class FinalMerchantComparison(BaseModel):
+    results: List[MerchantComparisonResult] = Field(description="Final Output of each comparison between raw and cleaned name")
+
+def compare_batch_with_reasoning(cdf_name: str, raw_names_batch: List[str]):
+    prompt = (
+    f"You are an excellent name cleaning and matching expert. You will be provided with two sets of information:\n"
+    f"1. **Cleaned Name**: '{cdf_name}'  This is the cleaned, standardized merchant name. Thoroughly understand the name for each comparison that you are going to make.\n"
+    f"2. **List of Raw Names**: {raw_names_batch} A list of raw, uncleaned merchant names extracted from transaction data of a bank.\n"
+    f"Your task is to compare each raw name present in the list of raw names with the cleaned name to see if the sequence of characters in both the raw name and cleaned name are close matches.\n"
+    f"Now respond the strength of match (score from 0 to 100) and reason for your score in less than 5 words. Your reason should match your decision for the score you have provided"
+    "Please strictly follow the format provided for your response: {format_instructions}"
+    )
+    try:
+        # Initialize the chat model
+        chat = ChatOpenAI(
+            model="gpt-3.5-turbo-16k",
+            max_tokens=3000,
+            temperature=0,
+            openai_api_key = "api-key"
+        )
+        parser = PydanticOutputParser(pydantic_object=FinalMerchantComparison)
+        chain = LLMChain(
+            llm=chat,
+            prompt=PromptTemplate(
+                input_variables=["prompt"],partial_variables={"format_instructions": parser.get_format_instructions()},
+                template=prompt
+            )
+        )
+        response = chain.invoke({"prompt": prompt})
+        parsed_response = json.loads(response["text"])
+        return parsed_response
+    except Exception as e:
+        logging.error(f"Error processing {cdf_name}: {str(e)}")
+        return [{"decision": "error", "reason": f"Error: {str(e)}"} for _ in raw_names_batch]
+
+def sanitize_name(name):
+    # Remove any characters that could break JSON format or cause issues
+    # Remove non-printable characters and extra spaces
+    return ''.join(c for c in str(name) if c in string.printable).strip()
+
+# Processing each cdf_merchant_name with its corresponding raw names
+result_rows = []
+for cdf_name in df['cdf_merchant_name'].unique():
+    # Get all raw names corresponding to the current cdf_merchant_name
+    raw_names = df[df['cdf_merchant_name'] == cdf_name]['raw_name'].apply(sanitize_name).tolist()
+    # Split raw names into chunks of n
+    raw_name_chunks = chunk_list(raw_names, 10)
+    for raw_names_batch in raw_name_chunks:
+        # Compare the batch of raw names with the current cdf_merchant_name
+        comparisons = compare_batch_with_reasoning(cdf_name, raw_names_batch)
+        # Collect results into a new DataFrame structure
+        for raw_name, comparison in zip(raw_names_batch, comparisons['results']):
+            decision = comparison.get('decision')
+            reason = comparison.get('reason', '')
+            # Collect results into a new DataFrame structure
+            result_rows.append({
+                "cdf_merchant_name": cdf_name,
+                "raw_name": raw_name,
+                "mapped": decision,
+                "reason": reason
+            })
+
+# Convert results into a DataFrame
+result_df = pd.DataFrame(result_rows)
+result_df.to_csv('output2.csv', index=False)
